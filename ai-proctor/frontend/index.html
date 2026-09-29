@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Proctored Test</title>
+<style>
+  body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
+  .wrap{max-width:900px;margin:0 auto;padding:20px}
+  .card{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:16px}
+  button{background:#3b82f6;color:#fff;border:0;padding:10px 18px;border-radius:8px;font-size:15px;cursor:pointer}
+  button.red{background:#ef4444}
+  input[type=text]{padding:10px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#fff;width:260px}
+  textarea{width:100%;height:110px;background:#0f172a;color:#fff;border:1px solid #475569;border-radius:8px;padding:10px;box-sizing:border-box}
+  #banner{display:none;background:#dc2626;color:#fff;padding:14px;border-radius:10px;font-weight:600;margin-bottom:16px}
+  #cam{width:200px;border-radius:8px;transform:scaleX(-1)}
+  .row{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
+  #log{max-height:180px;overflow:auto;font-size:14px}
+  #log div{padding:4px 0;border-bottom:1px solid #334155}
+  .pill{padding:4px 10px;border-radius:999px;background:#334155;font-size:13px}
+  .pill.bad{background:#dc2626}
+  [hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div id="setup" class="card">
+    <h2>AI Proctored Test</h2>
+    <p>Is test me tumhara <b>webcam, mic, tab activity aur fullscreen</b> monitor hoga.
+       Koi video record nahi hota, sirf violation events log hote hain.</p>
+    <p><input type="text" id="name" placeholder="Tumhara naam"></p>
+    <p><label><input type="checkbox" id="consent"> Main monitoring ke liye consent deta/deti hoon</label></p>
+    <button onclick="startTest()">Start Test</button>
+  </div>
+
+  <div id="exam" hidden>
+    <div id="banner"></div>
+    <div class="card row">
+      <video id="cam" autoplay muted playsinline></video>
+      <div>
+        <div>Status: <span id="status" class="pill">Starting...</span></div>
+        <p>Violation score: <b id="score">0</b> / 10</p>
+        <button class="red" onclick="endTest()">Submit Test</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Q1. Explain the difference between a list and a tuple in Python.</h3>
+      <textarea placeholder="Yahan answer likho..."></textarea>
+      <h3>Q2. What is the time complexity of binary search? Why?</h3>
+      <textarea placeholder="Yahan answer likho..."></textarea>
+    </div>
+    <div class="card"><h3>Violation log</h3><div id="log"></div></div>
+  </div>
+
+  <div id="result" class="card" hidden>
+    <h2>Test submitted</h2>
+    <pre id="report" style="white-space:pre-wrap"></pre>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const SEND_MS = 400;
+let sid, ws, stream, timer, active = false, waiting = false, bannerTimer;
+const lastSent = {};
+
+async function startTest() {
+  if (!$('consent').checked) return alert('Pehle consent tick karo.');
+  const name = $('name').value.trim() || 'candidate';
+  sid = 'S' + Date.now();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({video: {width: 640, height: 480}, audio: true});
+  } catch (e) { return alert('Camera/mic permission chahiye: ' + e.message); }
+  $('cam').srcObject = stream;
+  try { await document.documentElement.requestFullscreen(); } catch (e) {}
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/${sid}?name=${encodeURIComponent(name)}`);
+  ws.onopen = () => {
+    active = true;
+    $('setup').hidden = true; $('exam').hidden = false;
+    timer = setInterval(sendFrame, SEND_MS);
+    startAudio();
+  };
+  ws.onmessage = e => { waiting = false; handle(JSON.parse(e.data)); };
+  ws.onclose = () => { waiting = false; };
+}
+
+function sendFrame() {
+  if (!active || waiting || ws.readyState !== 1) return;
+  const v = $('cam');
+  if (!v.videoWidth) return;
+  const c = document.createElement('canvas');
+  c.width = 480; c.height = 360;
+  c.getContext('2d').drawImage(v, 0, 0, 480, 360);
+  waiting = true;
+  c.toBlob(b => b && ws.readyState === 1 ? ws.send(b) : (waiting = false), 'image/jpeg', 0.7);
+}
+
+function handle(d) {
+  const st = $('status');
+  st.textContent = d.calibrating ? 'Calibrating... seedha dekho' : (d.active.length ? d.active.join(', ') : 'Monitoring');
+  st.classList.toggle('bad', d.active.length > 0 && !d.calibrating);
+  $('score').textContent = d.score;
+  (d.new || []).forEach(v => {
+    const row = document.createElement('div');
+    row.textContent = `[${v.time}] ${v.message}`;
+    $('log').prepend(row);
+    showBanner('⚠️ Suspicious activity detected: ' + v.message);
+  });
+  if (d.flagged) showBanner('🚩 Session flagged for review');
+}
+
+function showBanner(t) {
+  const b = $('banner');
+  b.textContent = t; b.style.display = 'block';
+  clearTimeout(bannerTimer);
+  bannerTimer = setTimeout(() => b.style.display = 'none', 5000);
+}
+
+// browser-side events (3 sec throttle per type)
+async function report(type, detail = '') {
+  if (!active) return;
+  const now = Date.now();
+  if (now - (lastSent[type] || 0) < 3000) return;
+  lastSent[type] = now;
+  try {
+    const r = await fetch('/api/event', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session_id: sid, type, detail})});
+    handle({...(await r.json()), active: []});
+  } catch (e) {}
+}
+
+document.addEventListener('visibilitychange', () => { if (document.hidden) report('TAB_SWITCH'); });
+window.addEventListener('blur', () => report('TAB_SWITCH', 'window focus lost'));
+['copy', 'paste', 'cut'].forEach(ev => document.addEventListener(ev, e => {
+  if (!active) return;
+  e.preventDefault(); report('COPY_PASTE', ev);
+}));
+document.addEventListener('contextmenu', e => { if (active) e.preventDefault(); });
+document.addEventListener('fullscreenchange', () => {
+  if (active && !document.fullscreenElement) {
+    report('FULLSCREEN_EXIT');
+    showBanner('Fullscreen me wapas jao (kahin bhi click karo)');
+    document.addEventListener('click', () => document.documentElement.requestFullscreen().catch(() => {}), {once: true});
+  }
+});
+
+// audio: awaaz lagataar ~3 sec se zyada ho to NOISE
+function startAudio() {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const an = ctx.createAnalyser(); an.fftSize = 1024;
+  ctx.createMediaStreamSource(stream).connect(an);
+  const buf = new Uint8Array(an.fftSize);
+  let loudSince = null;
+  setInterval(() => {
+    if (!active) return;
+    an.getByteTimeDomainData(buf);
+    let sum = 0;
+    for (const x of buf) { const n = (x - 128) / 128; sum += n * n; }
+    const rms = Math.sqrt(sum / buf.length);
+    if (rms > 0.08) {                     // threshold apne mic ke hisaab se tune karo
+      loudSince = loudSince || Date.now();
+      if (Date.now() - loudSince > 3000) { report('NOISE'); loudSince = null; }
+    } else loudSince = null;
+  }, 200);
+}
+
+async function endTest() {
+  active = false; clearInterval(timer);
+  if (ws) ws.close();
+  stream && stream.getTracks().forEach(t => t.stop());
+  if (document.fullscreenElement) document.exitFullscreen();
+  const r = await fetch('/api/report/' + sid);
+  $('report').textContent = JSON.stringify(await r.json(), null, 2);
+  $('exam').hidden = true; $('result').hidden = false;
+}
+</script>
+</body>
+</html>
